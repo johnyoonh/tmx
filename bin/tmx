@@ -1,0 +1,467 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TMX_VERSION="dev"
+TMX_DIR_OPTION="@tmx.dir"
+TMX_TAGS_OPTION="@tmx.tags"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  tmx [choose|c]
+  tmx status|s
+  tmx list|ls|l [--tag TAG]
+  tmx switch|co SESSION
+  tmx new|n SESSION [DIRECTORY]
+  tmx here|h [DIRECTORY]
+  tmx tag add|remove|list TAG [SESSION]
+  tmx snapshot|commit [-m MESSAGE]
+  tmx log
+  tmx restore [SNAPSHOT]
+  tmx clean [-n|--dry-run]
+
+Git-like tmux session workflow helper.
+USAGE
+}
+
+die() {
+  printf 'tmx: %s\n' "$*" >&2
+  exit 1
+}
+
+have() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+tmux_cmd() {
+  # TMX_TMUX_ARGS is intentionally shell-split so callers can pass "-L name -f file".
+  # shellcheck disable=SC2086
+  command "${TMX_TMUX_BIN:-tmux}" ${TMX_TMUX_ARGS:-} "$@"
+}
+
+canonical_dir() {
+  local dir="${1:-$PWD}"
+  [[ -d "$dir" ]] || return 1
+  (cd "$dir" && pwd -P)
+}
+
+sanitize_name() {
+  local leaf="$1"
+  leaf="${leaf//[^A-Za-z0-9_-]/-}"
+  leaf="${leaf##[-.]}"
+  leaf="${leaf%%[-.]}"
+  [[ -n "$leaf" ]] || leaf="root"
+  printf '%s\n' "$leaf"
+}
+
+path_hash() {
+  if have shasum; then
+    printf '%s' "$1" | shasum -a 1 | awk '{print substr($1, 1, 4)}'
+  else
+    printf '%s' "$1" | sha1sum | awk '{print substr($1, 1, 4)}'
+  fi
+}
+
+session_exists() {
+  tmux_cmd has-session -t "=$1" 2>/dev/null
+}
+
+session_option() {
+  tmux_cmd show-options -qv -t "$1" "$2" 2>/dev/null || true
+}
+
+session_dir() {
+  local dir
+  dir="$(session_option "$1" "$TMX_DIR_OPTION")"
+  if [[ -z "$dir" ]]; then
+    dir="$(session_option "$1" "@dir_path")"
+  fi
+  printf '%s\n' "$dir"
+}
+
+name_for_dir() {
+  local dir="$1" base hash name n stored
+  base="$(sanitize_name "$(basename "$dir")")"
+
+  if ! session_exists "$base"; then
+    printf '%s\n' "$base"
+    return 0
+  fi
+
+  stored="$(session_dir "$base")"
+  if [[ "$stored" == "$dir" ]]; then
+    printf '%s\n' "$base"
+    return 0
+  fi
+
+  hash="$(path_hash "$dir")"
+  name="${base}-${hash}"
+  if ! session_exists "$name" || [[ "$(session_dir "$name")" == "$dir" ]]; then
+    printf '%s\n' "$name"
+    return 0
+  fi
+
+  n=2
+  while session_exists "${name}-${n}" && [[ "$(session_dir "${name}-${n}")" != "$dir" ]]; do
+    n=$((n + 1))
+  done
+  printf '%s\n' "${name}-${n}"
+}
+
+current_session() {
+  tmux_cmd display-message -p '#S' 2>/dev/null || true
+}
+
+set_session_dir() {
+  tmux_cmd set-option -q -t "$1" "$TMX_DIR_OPTION" "$2"
+}
+
+ensure_session() {
+  local name="$1" dir="$2"
+  if ! session_exists "$name"; then
+    tmux_cmd new-session -d -s "$name" -c "$dir"
+  fi
+  set_session_dir "$name" "$dir"
+}
+
+attach_or_switch() {
+  local name="$1"
+  if [[ "${TMX_NO_ATTACH:-0}" == "1" ]]; then
+    printf '%s\n' "$name"
+    return 0
+  fi
+  if [[ -n "${TMUX:-}" ]]; then
+    tmux_cmd switch-client -t "=$name"
+  else
+    exec "${TMX_TMUX_BIN:-tmux}" ${TMX_TMUX_ARGS:-} attach-session -t "=$name"
+  fi
+}
+
+list_rows() {
+  { tmux_cmd list-sessions -F '#S	#{session_attached}	#{session_activity}	#{@tmx.dir}	#{@dir_path}	#{@tmx.tags}' 2>/dev/null || true; } |
+    awk -F '\t' -v tag_filter="${1:-}" '
+      {
+        dir = $4 != "" ? $4 : $5
+        tags = $6
+        if (tag_filter != "") {
+          found = 0
+          n = split(tags, parts, ",")
+          for (i = 1; i <= n; i++) if (parts[i] == tag_filter) found = 1
+          if (!found) next
+        }
+        printf "%s\t%s\t%s\t%s\t%s\n", $1, $2, $3, dir, tags
+      }' |
+    sort -t "$(printf '\t')" -k3,3nr
+}
+
+cmd_list() {
+  local tag=""
+  while (($#)); do
+    case "$1" in
+      --tag)
+        shift
+        [[ $# -gt 0 ]] || die "--tag requires a value"
+        tag="$1"
+        ;;
+      *) die "unknown list option: $1" ;;
+    esac
+    shift
+  done
+  list_rows "$tag" | awk -F '\t' '{
+    attached = $2 > 0 ? "attached" : "detached"
+    dir = $4 == "" ? "-" : $4
+    tags = $5 == "" ? "-" : $5
+    printf "%-28s %-9s %-24s %s\n", $1, attached, tags, dir
+  }'
+}
+
+cmd_status() {
+  local current latest latest_meta
+  current="$(current_session)"
+  printf 'current: %s\n\n' "${current:-not attached}"
+  printf 'sessions:\n'
+  cmd_list
+  latest="$(latest_snapshot || true)"
+  if [[ -n "$latest" ]]; then
+    latest_meta="${latest}.tmx-meta"
+    printf '\nlatest snapshot: %s\n' "$(basename "$latest")"
+    if [[ -f "$latest_meta" ]]; then
+      awk -F '=' '/^(message|session|created_at)=/ { printf "  %s: %s\n", $1, $2 }' "$latest_meta"
+    fi
+  else
+    printf '\nlatest snapshot: none\n'
+  fi
+}
+
+cmd_new() {
+  [[ $# -ge 1 ]] || die "new requires a session name"
+  local name="$1" dir="${2:-$PWD}"
+  dir="$(canonical_dir "$dir")" || die "not a directory: ${2:-$PWD}"
+  if session_exists "$name"; then
+    die "session already exists: $name"
+  fi
+  tmux_cmd new-session -d -s "$name" -c "$dir"
+  set_session_dir "$name" "$dir"
+  attach_or_switch "$name"
+}
+
+cmd_here() {
+  local dir name
+  dir="$(canonical_dir "${1:-$PWD}")" || die "not a directory: ${1:-$PWD}"
+  name="$(name_for_dir "$dir")"
+  ensure_session "$name" "$dir"
+  attach_or_switch "$name"
+}
+
+cmd_switch() {
+  [[ $# -eq 1 ]] || die "switch requires a session name"
+  local target="$1" match
+  if [[ "$target" == "-" ]]; then
+    tmux_cmd switch-client -l
+    return 0
+  fi
+  if session_exists "$target"; then
+    attach_or_switch "$target"
+    return 0
+  fi
+  match="$(list_rows | awk -F '\t' -v q="$target" '$1 == q { print $1; exit }')"
+  [[ -n "$match" ]] || die "no session named: $target"
+  attach_or_switch "$match"
+}
+
+choose_session() {
+  local rows choice
+  rows="$(list_rows | awk -F '\t' '{ dir = $4 == "" ? "-" : $4; tags = $5 == "" ? "-" : $5; printf "%s\t%s\t%s\n", $1, tags, dir }')"
+  [[ -n "$rows" ]] || die "no tmux sessions found"
+  if have fzf; then
+    choice="$(printf '%s\n' "$rows" | fzf \
+      --with-nth=1,2,3 \
+      --delimiter=$'\t' \
+      --prompt='tmx session> ' \
+      --header='Ctrl-R refreshes sessions' \
+      --bind "ctrl-r:reload($0 list)")" || exit 130
+  else
+    printf '%s\n' "$rows"
+    printf 'session> ' >/dev/tty
+    read -r choice </dev/tty
+  fi
+  printf '%s\n' "${choice%%$'\t'*}"
+}
+
+cmd_choose() {
+  local name
+  name="$(choose_session)"
+  [[ -n "$name" ]] || exit 130
+  attach_or_switch "$name"
+}
+
+normalize_tags() {
+  tr ',' '\n' | awk 'NF && !seen[$0]++ { print }' | paste -sd ',' -
+}
+
+cmd_tag() {
+  [[ $# -ge 1 ]] || die "tag requires add, remove, or list"
+  local action="$1"
+  shift
+  local tag session current tags new_tags
+  case "$action" in
+    add)
+      [[ $# -ge 1 ]] || die "tag add requires a tag"
+      tag="$1"
+      session="${2:-$(current_session)}"
+      [[ -n "$session" ]] || die "not attached; pass a session name"
+      session_exists "$session" || die "no session named: $session"
+      tags="$(session_option "$session" "$TMX_TAGS_OPTION")"
+      new_tags="$(printf '%s,%s\n' "$tags" "$tag" | normalize_tags)"
+      tmux_cmd set-option -q -t "$session" "$TMX_TAGS_OPTION" "$new_tags"
+      ;;
+    remove|rm)
+      [[ $# -ge 1 ]] || die "tag remove requires a tag"
+      tag="$1"
+      session="${2:-$(current_session)}"
+      [[ -n "$session" ]] || die "not attached; pass a session name"
+      session_exists "$session" || die "no session named: $session"
+      tags="$(session_option "$session" "$TMX_TAGS_OPTION")"
+      new_tags="$(printf '%s\n' "$tags" | tr ',' '\n' | awk -v tag="$tag" 'NF && $0 != tag { print }' | paste -sd ',' -)"
+      if [[ -n "$new_tags" ]]; then
+        tmux_cmd set-option -q -t "$session" "$TMX_TAGS_OPTION" "$new_tags"
+      else
+        tmux_cmd set-option -qu -t "$session" "$TMX_TAGS_OPTION" 2>/dev/null || true
+      fi
+      ;;
+    list|ls)
+      session="${1:-$(current_session)}"
+      [[ -n "$session" ]] || die "not attached; pass a session name"
+      session_exists "$session" || die "no session named: $session"
+      tags="$(session_option "$session" "$TMX_TAGS_OPTION")"
+      [[ -n "$tags" ]] && printf '%s\n' "$tags" | tr ',' '\n'
+      return 0
+      ;;
+    *) die "unknown tag action: $action" ;;
+  esac
+}
+
+resurrect_dir() {
+  local dir
+  dir="${TMX_RESURRECT_DIR:-}"
+  if [[ -z "$dir" ]]; then
+    dir="$(tmux_cmd show-option -gqv @resurrect-dir 2>/dev/null || true)"
+  fi
+  printf '%s\n' "${dir:-$HOME/.tmux/resurrect}"
+}
+
+latest_snapshot() {
+  local dir
+  dir="$(resurrect_dir)"
+  [[ -d "$dir" ]] || return 1
+  find "$dir" -maxdepth 1 -type f -name 'tmux_resurrect_*' ! -name '*.tmx-meta' -print 2>/dev/null |
+    sort |
+    tail -n 1
+}
+
+resurrect_save_script() {
+  local script
+  script="${TMX_RESURRECT_SAVE_SCRIPT:-}"
+  if [[ -z "$script" ]]; then
+    script="$(tmux_cmd show-option -gqv @resurrect-save-script-path 2>/dev/null || true)"
+  fi
+  if [[ -z "$script" ]]; then
+    script="$HOME/.tmux/plugins/tmux-resurrect/scripts/save.sh"
+  fi
+  [[ -x "$script" ]] || return 1
+  printf '%s\n' "$script"
+}
+
+resurrect_restore_script() {
+  local script
+  script="${TMX_RESURRECT_RESTORE_SCRIPT:-}"
+  if [[ -z "$script" ]]; then
+    script="$(tmux_cmd show-option -gqv @resurrect-restore-script-path 2>/dev/null || true)"
+  fi
+  if [[ -z "$script" ]]; then
+    script="$HOME/.tmux/plugins/tmux-resurrect/scripts/restore.sh"
+  fi
+  [[ -x "$script" ]] || return 1
+  printf '%s\n' "$script"
+}
+
+cmd_snapshot() {
+  local message="" opt before after meta session tags
+  while (($#)); do
+    opt="$1"
+    case "$opt" in
+      -m|--message)
+        shift
+        [[ $# -gt 0 ]] || die "$opt requires a message"
+        message="$1"
+        ;;
+      *) die "unknown snapshot option: $1" ;;
+    esac
+    shift
+  done
+  local save_script
+  save_script="$(resurrect_save_script)" || die "tmux-resurrect save script not found"
+  before="$(latest_snapshot || true)"
+  "$save_script" quiet
+  after="$(latest_snapshot || true)"
+  [[ -n "$after" ]] || die "tmux-resurrect did not create a snapshot"
+  [[ "$after" != "$before" || -f "$after" ]] || die "tmux-resurrect snapshot not found"
+  session="$(current_session)"
+  tags=""
+  [[ -n "$session" ]] && tags="$(session_option "$session" "$TMX_TAGS_OPTION")"
+  meta="${after}.tmx-meta"
+  {
+    printf 'created_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'session=%s\n' "$session"
+    printf 'tags=%s\n' "$tags"
+    printf 'message=%s\n' "$message"
+  } >"$meta"
+  printf '%s\n' "$after"
+}
+
+cmd_log() {
+  local dir file meta
+  dir="$(resurrect_dir)"
+  [[ -d "$dir" ]] || die "snapshot directory not found: $dir"
+  find "$dir" -maxdepth 1 -type f -name 'tmux_resurrect_*' ! -name '*.tmx-meta' -print 2>/dev/null |
+    sort -r |
+    while IFS= read -r file; do
+      meta="${file}.tmx-meta"
+      printf '%s' "$(basename "$file")"
+      if [[ -f "$meta" ]]; then
+        awk -F '=' '
+          $1 == "message" && $2 != "" { msg=$2 }
+          $1 == "session" && $2 != "" { sess=$2 }
+          END {
+            if (sess != "") printf " session=%s", sess
+            if (msg != "") printf " message=%s", msg
+          }' "$meta"
+      fi
+      printf '\n'
+    done
+}
+
+cmd_restore() {
+  local restore_script snapshot="${1:-}"
+  restore_script="$(resurrect_restore_script)" || die "tmux-resurrect restore script not found"
+  if [[ -n "$snapshot" ]]; then
+    local dir last_link target
+    dir="$(resurrect_dir)"
+    target="$snapshot"
+    [[ "$target" = /* ]] || target="$dir/$target"
+    [[ -f "$target" ]] || die "snapshot not found: $snapshot"
+    last_link="$dir/last"
+    ln -sf "$(basename "$target")" "$last_link"
+  fi
+  "$restore_script"
+}
+
+cmd_clean() {
+  local dry_run=0
+  while (($#)); do
+    case "$1" in
+      -n|--dry-run) dry_run=1 ;;
+      *) die "unknown clean option: $1" ;;
+    esac
+    shift
+  done
+  local sessions
+  sessions="$({ tmux_cmd list-sessions -F '#S	#{session_attached}' 2>/dev/null || true; } | awk -F '\t' '$2 == 0 { print $1 }')"
+  if [[ -z "$sessions" ]]; then
+    printf 'No detached sessions.\n'
+    return 0
+  fi
+  if ((dry_run)); then
+    printf '%s\n' "$sessions"
+    return 0
+  fi
+  while IFS= read -r session; do
+    [[ -n "$session" ]] || continue
+    tmux_cmd kill-session -t "=$session"
+    printf 'killed %s\n' "$session"
+  done <<<"$sessions"
+}
+
+main() {
+  local cmd="${1:-choose}"
+  [[ $# -gt 0 ]] && shift || true
+  case "$cmd" in
+    -h|--help|help) usage ;;
+    --version|version) printf 'tmx %s\n' "$TMX_VERSION" ;;
+    choose|c) cmd_choose "$@" ;;
+    status|s) cmd_status "$@" ;;
+    list|ls|l) cmd_list "$@" ;;
+    switch|co) cmd_switch "$@" ;;
+    -) cmd_switch - ;;
+    new|n) cmd_new "$@" ;;
+    here|h) cmd_here "$@" ;;
+    tag) cmd_tag "$@" ;;
+    snapshot|commit) cmd_snapshot "$@" ;;
+    log) cmd_log "$@" ;;
+    restore) cmd_restore "$@" ;;
+    clean|cln) cmd_clean "$@" ;;
+    *) die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"
