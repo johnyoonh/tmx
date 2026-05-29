@@ -30,6 +30,9 @@ Requirements:
 - `fzf` for the interactive chooser
 - `tmux-resurrect` for `tmx snapshot` / `tmx commit`
 
+`tmux-continuum` is not required. It can autosave tmux-resurrect snapshots if
+you already use it, but `tmx` only calls tmux-resurrect directly.
+
 ## Commands
 
 | Git habit | tmx command | Tmux behavior |
