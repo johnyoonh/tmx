@@ -42,8 +42,10 @@ Requirements:
 | picker workflow | `tmx`, `tmx choose`, `tmx c` | Open a fuzzy session chooser |
 | `git tag` | `tmx tag add/remove/list` | Store labels on tmux sessions |
 | `git commit` | `tmx snapshot`, `tmx commit` | Save tmux state with tmux-resurrect |
+| `git diff` | `tmx diff [snapshot]` | Compare a saved snapshot with live tmux state |
 | `git log` | `tmx log` | List saved snapshots |
 | `git clean -n/-fd` | `tmx clean -n`, `tmx clean` | Preview or kill detached sessions |
+| `git remote` | `tmx remote` | Manage named tmux server profiles |
 
 ## Examples
 
@@ -86,24 +88,48 @@ tmx clean --dry-run
 tmx clean
 ```
 
+Compare live tmux state with a saved snapshot:
+
+```sh
+tmx diff
+tmx diff tmux_resurrect_2026-05-29T190000.txt
+```
+
+## Remotes and sockets
+
+In `tmx`, a remote is a named tmux connection profile. It is closer to "which
+tmux server/socket should I operate on?" than Git's distributed repository
+sync model.
+
+Add and use a profile:
+
+```sh
+tmx remote add work --tmux-args '-L work'
+tmx --remote work list
+tmx -r work status
+```
+
+Use one-off socket selectors:
+
+```sh
+tmx --tmux-args '-L codex' ls
+tmx --socket-name codex status
+tmx --socket-path /tmp/tmux-custom list
+```
+
+Remote profiles are stored in:
+
+```text
+~/.config/tmx/config
+```
+
 ## Metadata
 
 `tmx` stores session metadata in tmux user options:
 
 - `@tmx.dir`: directory associated with the session
 - `@tmx.tags`: comma-separated session tags
+- `@tmx.remote`: remote/profile that created the session, when applicable
 
 For compatibility while migrating from local scripts, `tmx list` also reads
 legacy `@dir_path` values.
-
-## Alternate tmux sockets
-
-Use `TMX_TMUX_ARGS` for isolated sockets or custom tmux configs:
-
-```sh
-TMX_TMUX_ARGS='-L work' tmx list
-```
-
-Remote profiles are intentionally not part of v1. They are planned as a future
-layer over alternate sockets, configs, and SSH commands.
-

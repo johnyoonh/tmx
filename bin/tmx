@@ -8,17 +8,25 @@ TMX_TAGS_OPTION="@tmx.tags"
 usage() {
   cat <<'USAGE'
 Usage:
-  tmx [choose|c]
+  tmx [GLOBAL OPTIONS] [choose|c]
   tmx status|s
   tmx list|ls|l [--tag TAG]
   tmx switch|co SESSION
   tmx new|n SESSION [DIRECTORY]
   tmx here|h [DIRECTORY]
+  tmx remote add|remove|list NAME [--tmux-args ARGS] [--ssh COMMAND]
   tmx tag add|remove|list TAG [SESSION]
   tmx snapshot|commit [-m MESSAGE]
+  tmx diff [SNAPSHOT]
   tmx log
   tmx restore [SNAPSHOT]
   tmx clean [-n|--dry-run]
+
+Global options:
+  -r, --remote NAME        Use a named remote/profile.
+      --tmux-args ARGS    Pass raw tmux arguments, such as "-L work".
+      --socket-name NAME   Use tmux socket name, equivalent to "-L NAME".
+      --socket-path PATH   Use tmux socket path, equivalent to "-S PATH".
 
 Git-like tmux session workflow helper.
 USAGE
@@ -37,6 +45,43 @@ tmux_cmd() {
   # TMX_TMUX_ARGS is intentionally shell-split so callers can pass "-L name -f file".
   # shellcheck disable=SC2086
   command "${TMX_TMUX_BIN:-tmux}" ${TMX_TMUX_ARGS:-} "$@"
+}
+
+config_dir() {
+  printf '%s\n' "${TMX_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/tmx}"
+}
+
+config_file() {
+  printf '%s\n' "$(config_dir)/config"
+}
+
+ensure_config_dir() {
+  mkdir -p "$(config_dir)"
+}
+
+remote_line() {
+  local name="$1" file
+  file="$(config_file)"
+  [[ -f "$file" ]] || return 1
+  awk -F '\t' -v name="$name" '$1 == "remote" && $2 == name { print; found=1; exit } END { exit found ? 0 : 1 }' "$file"
+}
+
+remote_field() {
+  local name="$1" field="$2" line
+  line="$(remote_line "$name")" || return 1
+  case "$field" in
+    tmux_args) printf '%s\n' "$(printf '%s\n' "$line" | awk -F '\t' '{print $3}')" ;;
+    ssh) printf '%s\n' "$(printf '%s\n' "$line" | awk -F '\t' '{print $4}')" ;;
+    *) return 1 ;;
+  esac
+}
+
+apply_remote() {
+  local name="$1" args
+  args="$(remote_field "$name" tmux_args)" || die "remote not found: $name"
+  [[ -n "$args" ]] && TMX_TMUX_ARGS="$args"
+  TMX_REMOTE="$name"
+  export TMX_TMUX_ARGS TMX_REMOTE
 }
 
 canonical_dir() {
@@ -114,6 +159,9 @@ current_session() {
 
 set_session_dir() {
   tmux_cmd set-option -q -t "$1" "$TMX_DIR_OPTION" "$2"
+  if [[ -n "${TMX_REMOTE:-}" ]]; then
+    tmux_cmd set-option -q -t "$1" "@tmx.remote" "$TMX_REMOTE"
+  fi
 }
 
 ensure_session() {
@@ -138,18 +186,19 @@ attach_or_switch() {
 }
 
 list_rows() {
-  { tmux_cmd list-sessions -F '#S	#{session_attached}	#{session_activity}	#{@tmx.dir}	#{@dir_path}	#{@tmx.tags}' 2>/dev/null || true; } |
+  { tmux_cmd list-sessions -F '#S	#{session_attached}	#{session_activity}	#{@tmx.dir}	#{@dir_path}	#{@tmx.tags}	#{@tmx.remote}' 2>/dev/null || true; } |
     awk -F '\t' -v tag_filter="${1:-}" '
       {
         dir = $4 != "" ? $4 : $5
         tags = $6
+        remote = $7
         if (tag_filter != "") {
           found = 0
           n = split(tags, parts, ",")
           for (i = 1; i <= n; i++) if (parts[i] == tag_filter) found = 1
           if (!found) next
         }
-        printf "%s\t%s\t%s\t%s\t%s\n", $1, $2, $3, dir, tags
+        printf "%s\t%s\t%s\t%s\t%s\t%s\n", $1, $2, $3, dir, tags, remote
       }' |
     sort -t "$(printf '\t')" -k3,3nr
 }
@@ -171,7 +220,8 @@ cmd_list() {
     attached = $2 > 0 ? "attached" : "detached"
     dir = $4 == "" ? "-" : $4
     tags = $5 == "" ? "-" : $5
-    printf "%-28s %-9s %-24s %s\n", $1, attached, tags, dir
+    remote = $6 == "" ? "-" : $6
+    printf "%-28s %-9s %-18s %-12s %s\n", $1, attached, tags, remote, dir
   }'
 }
 
@@ -231,11 +281,11 @@ cmd_switch() {
 
 choose_session() {
   local rows choice
-  rows="$(list_rows | awk -F '\t' '{ dir = $4 == "" ? "-" : $4; tags = $5 == "" ? "-" : $5; printf "%s\t%s\t%s\n", $1, tags, dir }')"
+  rows="$(list_rows | awk -F '\t' '{ dir = $4 == "" ? "-" : $4; tags = $5 == "" ? "-" : $5; remote = $6 == "" ? "-" : $6; printf "%s\t%s\t%s\t%s\n", $1, tags, remote, dir }')"
   [[ -n "$rows" ]] || die "no tmux sessions found"
   if have fzf; then
     choice="$(printf '%s\n' "$rows" | fzf \
-      --with-nth=1,2,3 \
+      --with-nth=1,2,3,4 \
       --delimiter=$'\t' \
       --prompt='tmx session> ' \
       --header='Ctrl-R refreshes sessions' \
@@ -253,6 +303,56 @@ cmd_choose() {
   name="$(choose_session)"
   [[ -n "$name" ]] || exit 130
   attach_or_switch "$name"
+}
+
+cmd_remote() {
+  [[ $# -ge 1 ]] || die "remote requires add, remove, or list"
+  local action="$1"
+  shift
+  local name tmux_args="" ssh_cmd="" file tmp
+  file="$(config_file)"
+  case "$action" in
+    add)
+      [[ $# -ge 1 ]] || die "remote add requires a name"
+      name="$1"
+      shift
+      while (($#)); do
+        case "$1" in
+          --tmux-args)
+            shift
+            [[ $# -gt 0 ]] || die "--tmux-args requires a value"
+            tmux_args="$1"
+            ;;
+          --ssh)
+            shift
+            [[ $# -gt 0 ]] || die "--ssh requires a value"
+            ssh_cmd="$1"
+            ;;
+          *) die "unknown remote add option: $1" ;;
+        esac
+        shift
+      done
+      [[ -n "$tmux_args$ssh_cmd" ]] || die "remote add requires --tmux-args or --ssh"
+      ensure_config_dir
+      tmp="${file}.tmp"
+      { [[ -f "$file" ]] && awk -F '\t' -v name="$name" '!($1 == "remote" && $2 == name)' "$file"; true; } >"$tmp"
+      printf 'remote\t%s\t%s\t%s\n' "$name" "$tmux_args" "$ssh_cmd" >>"$tmp"
+      mv "$tmp" "$file"
+      ;;
+    remove|rm)
+      [[ $# -eq 1 ]] || die "remote remove requires a name"
+      name="$1"
+      [[ -f "$file" ]] || return 0
+      tmp="${file}.tmp"
+      awk -F '\t' -v name="$name" '!($1 == "remote" && $2 == name)' "$file" >"$tmp"
+      mv "$tmp" "$file"
+      ;;
+    list|ls)
+      [[ -f "$file" ]] || return 0
+      awk -F '\t' '$1 == "remote" { args = $3 == "" ? "-" : $3; ssh = $4 == "" ? "-" : $4; printf "%-16s %-28s %s\n", $2, args, ssh }' "$file"
+      ;;
+    *) die "unknown remote action: $action" ;;
+  esac
 }
 
 normalize_tags() {
@@ -401,6 +501,30 @@ cmd_log() {
     done
 }
 
+dump_live_state() {
+  {
+    tmux_cmd list-sessions -F 'session	#S	attached=#{session_attached}	dir=#{@tmx.dir}	tags=#{@tmx.tags}	remote=#{@tmx.remote}' 2>/dev/null || true
+    tmux_cmd list-windows -a -F 'window	#{session_name}	#{window_index}	#{window_name}	#{window_layout}' 2>/dev/null || true
+    tmux_cmd list-panes -a -F 'pane	#{session_name}	#{window_index}.#{pane_index}	#{pane_current_path}	#{pane_current_command}' 2>/dev/null || true
+  } | sort
+}
+
+cmd_diff() {
+  local snapshot="${1:-}" dir target live_file
+  if [[ -z "$snapshot" ]]; then
+    snapshot="$(latest_snapshot || true)"
+    [[ -n "$snapshot" ]] || die "no snapshot found"
+  fi
+  dir="$(resurrect_dir)"
+  target="$snapshot"
+  [[ "$target" = /* ]] || target="$dir/$target"
+  [[ -f "$target" ]] || die "snapshot not found: $snapshot"
+  live_file="$(mktemp "${TMPDIR:-/tmp}/tmx-live.XXXXXX")"
+  dump_live_state >"$live_file"
+  diff -u "$target" "$live_file" || true
+  rm -f "$live_file"
+}
+
 cmd_restore() {
   local restore_script snapshot="${1:-}"
   restore_script="$(resurrect_restore_script)" || die "tmux-resurrect restore script not found"
@@ -443,6 +567,44 @@ cmd_clean() {
 }
 
 main() {
+  while (($#)); do
+    case "$1" in
+      -r|--remote)
+        shift
+        [[ $# -gt 0 ]] || die "--remote requires a name"
+        apply_remote "$1"
+        shift
+        ;;
+      --tmux-args)
+        shift
+        [[ $# -gt 0 ]] || die "--tmux-args requires a value"
+        TMX_TMUX_ARGS="$1"
+        export TMX_TMUX_ARGS
+        shift
+        ;;
+      --socket-name)
+        shift
+        [[ $# -gt 0 ]] || die "--socket-name requires a name"
+        TMX_TMUX_ARGS="-L $1"
+        export TMX_TMUX_ARGS
+        shift
+        ;;
+      --socket-path)
+        shift
+        [[ $# -gt 0 ]] || die "--socket-path requires a path"
+        TMX_TMUX_ARGS="-S $1"
+        export TMX_TMUX_ARGS
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
   local cmd="${1:-choose}"
   [[ $# -gt 0 ]] && shift || true
   case "$cmd" in
@@ -455,8 +617,10 @@ main() {
     -) cmd_switch - ;;
     new|n) cmd_new "$@" ;;
     here|h) cmd_here "$@" ;;
+    remote) cmd_remote "$@" ;;
     tag) cmd_tag "$@" ;;
     snapshot|commit) cmd_snapshot "$@" ;;
+    diff|d) cmd_diff "$@" ;;
     log) cmd_log "$@" ;;
     restore) cmd_restore "$@" ;;
     clean|cln) cmd_clean "$@" ;;

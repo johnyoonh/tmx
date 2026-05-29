@@ -15,6 +15,7 @@ trap cleanup EXIT
 
 export TMX_TMUX_ARGS="-L $SOCKET"
 export TMX_NO_ATTACH=1
+export TMX_CONFIG_HOME="$TMP_DIR/config"
 
 assert_contains() {
   local haystack="$1" needle="$2"
@@ -47,6 +48,17 @@ assert_contains "$list_output" "$TMP_DIR/project one"
 list_output="$("$TMX" ls)"
 assert_contains "$list_output" "scratch"
 
+"$TMX" remote add testremote --tmux-args "-L $SOCKET"
+remote_output="$("$TMX" remote list)"
+assert_contains "$remote_output" "testremote"
+remote_here="$(cd "$TMP_DIR/project_two" && "$TMX" --remote testremote here)"
+[[ "$remote_here" == "project_two" ]]
+remote_list="$("$TMX" -r testremote list)"
+assert_contains "$remote_list" "testremote"
+
+socket_output="$(TMX_TMUX_ARGS= "$TMX" --socket-name "$SOCKET" list)"
+assert_contains "$socket_output" "project-one"
+
 "$TMX" tag add ai project-one
 tags="$("$TMX" tag list project-one)"
 assert_contains "$tags" "ai"
@@ -69,6 +81,7 @@ if "$TMX" snapshot -m test >/tmp/tmx-snapshot.out 2>/tmp/tmx-snapshot.err; then
   snapshot="$(cat /tmp/tmx-snapshot.out)"
   [[ -f "$snapshot" ]]
   [[ -f "${snapshot}.tmx-meta" ]]
+  "$TMX" diff "$snapshot" >/tmp/tmx-diff.out
 else
   snapshot_err="$(cat /tmp/tmx-snapshot.err)"
   if [[ "$snapshot_err" != *"tmux-resurrect save script not found"* &&
