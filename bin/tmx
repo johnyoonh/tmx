@@ -8,12 +8,13 @@ TMX_TAGS_OPTION="@tmx.tags"
 usage() {
   cat <<'USAGE'
 Usage:
-  tmx [GLOBAL OPTIONS] [choose|c]
+  tmx [GLOBAL OPTIONS] [choose|c] [--detached|-d]
   tmx status|s
   tmx list|ls|l [--tag TAG]
   tmx switch|co SESSION
   tmx new|n SESSION [DIRECTORY]
   tmx here|h [DIRECTORY]
+  tmx detach-others [-n|--dry-run] [CLIENT_TTY]
   tmx remote add|remove|list NAME [--tmux-args ARGS] [--ssh COMMAND]
   tmx tag add|remove|list TAG [SESSION]
   tmx snapshot|commit [-m MESSAGE]
@@ -216,13 +217,23 @@ cmd_list() {
     esac
     shift
   done
-  list_rows "$tag" | awk -F '\t' '{
-    attached = $2 > 0 ? "attached" : "detached"
-    dir = $4 == "" ? "-" : $4
-    tags = $5 == "" ? "-" : $5
-    remote = $6 == "" ? "-" : $6
-    printf "%-28s %-9s %-18s %-12s %s\n", $1, attached, tags, remote, dir
-  }'
+  # Print header
+  printf "%-28s %-9s %-16s %-18s %-12s %s\n" "SESSION" "STATUS" "LAST ACTIVE" "TAGS" "REMOTE" "DIRECTORY"
+  printf "%-28s %-9s %-16s %-18s %-12s %s\n" "-------" "------" "-----------" "----" "------" "---------"
+  list_rows "$tag" | while IFS=$'\t' read -r name attached activity dir tags remote; do
+    local last_active="-"
+    if [[ -n "$activity" && "$activity" != "0" ]]; then
+      last_active=$(date -r "$activity" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "-")
+    fi
+    local status_str="detached"
+    if (( attached > 0 )); then
+      status_str="attached"
+    fi
+    [[ -n "$dir" ]] || dir="-"
+    [[ -n "$tags" ]] || tags="-"
+    [[ -n "$remote" ]] || remote="-"
+    printf "%-28s %-9s %-16s %-18s %-12s %s\n" "$name" "$status_str" "$last_active" "$tags" "$remote" "$dir"
+  done
 }
 
 cmd_status() {
@@ -280,27 +291,75 @@ cmd_switch() {
 }
 
 choose_session() {
+  local detached_only=0 opt
+  while (($#)); do
+    opt="$1"
+    case "$opt" in
+      -d|--detached)
+        detached_only=1
+        ;;
+      *) die "unknown choose option: $opt" ;;
+    esac
+    shift
+  done
+
   local rows choice
-  rows="$(list_rows | awk -F '\t' '{ dir = $4 == "" ? "-" : $4; tags = $5 == "" ? "-" : $5; remote = $6 == "" ? "-" : $6; printf "%s\t%s\t%s\t%s\n", $1, tags, remote, dir }')"
-  [[ -n "$rows" ]] || die "no tmux sessions found"
+  rows="$(list_rows | awk -F '\t' -v det="$detached_only" '
+    det && $2 > 0 { next }
+    {
+      dir = $4 == "" ? "-" : $4
+      tags = $5 == "" ? "-" : $5
+      remote = $6 == "" ? "-" : $6
+      printf "%-28s\t%-18s\t%-12s\t%s\n", $1, tags, remote, dir
+    }')"
+  [[ -n "$rows" ]] || die "no matching tmux sessions found"
   if have fzf; then
+    local reload_cmd
+    if (( detached_only )); then
+      reload_cmd="tmux list-sessions -F '#S	#{session_attached}	#{session_activity}	#{@tmx.dir}	#{@dir_path}	#{@tmx.tags}	#{@tmx.remote}' 2>/dev/null | awk -F '\t' '\$2 == 0 { dir = \$4 != \"\" ? \$4 : \$5; tags = \$6 == \"\" ? \"-\" : \$6; remote = \$7 == \"\" ? \"-\" : \$7; printf \"%-28s\t%-18s\t%-12s\t%s\n\", \$1, tags, remote, dir }'"
+    else
+      reload_cmd="tmux list-sessions -F '#S	#{session_attached}	#{session_activity}	#{@tmx.dir}	#{@dir_path}	#{@tmx.tags}	#{@tmx.remote}' 2>/dev/null | awk -F '\t' '{ dir = \$4 != \"\" ? \$4 : \$5; tags = \$6 == \"\" ? \"-\" : \$6; remote = \$7 == \"\" ? \"-\" : \$7; printf \"%-28s\t%-18s\t%-12s\t%s\n\", \$1, tags, remote, dir }'"
+    fi
+
+    local header_text="SESSION                         TAGS                    REMOTE          DIRECTORY
+enter: attach │ ctrl-x: kill │ ctrl-r: refresh"
+
     choice="$(printf '%s\n' "$rows" | fzf \
       --with-nth=1,2,3,4 \
       --delimiter=$'\t' \
       --prompt='tmx session> ' \
-      --header='Ctrl-R refreshes sessions' \
-      --bind "ctrl-r:reload($0 list)")" || exit 130
+      --header="$header_text" \
+      --header-first \
+      --preview 'tmux capture-pane -p -S - -t $(echo {1}) 2>/dev/null' \
+      --preview-window 'right:60%:follow' \
+      --bind "ctrl-x:reload(tmux kill-session -t \$(echo {1}) 2>/dev/null; $reload_cmd)" \
+      --bind "ctrl-r:reload($reload_cmd)")" || exit 130
   else
     printf '%s\n' "$rows"
     printf 'session> ' >/dev/tty
     read -r choice </dev/tty
   fi
-  printf '%s\n' "${choice%%$'\t'*}"
+  local name="${choice%%$'\t'*}"
+  printf '%s\n' "${name%% *}"
 }
 
 cmd_choose() {
+  local detached_only=0 opt
+  local -a choose_args=()
+  while (($#)); do
+    opt="$1"
+    case "$opt" in
+      -d|--detached)
+        detached_only=1
+        choose_args+=("$opt")
+        ;;
+      *) die "unknown choose option: $opt" ;;
+    esac
+    shift
+  done
+
   local name
-  name="$(choose_session)"
+  name="$(choose_session "${choose_args[@]+"${choose_args[@]}"}")"
   [[ -n "$name" ]] || exit 130
   attach_or_switch "$name"
 }
@@ -566,6 +625,51 @@ cmd_clean() {
   done <<<"$sessions"
 }
 
+cmd_detach_others() {
+  local dry_run=0 keep_client="" client count=0
+  while (($#)); do
+    case "$1" in
+      -n|--dry-run)
+        dry_run=1
+        ;;
+      --)
+        shift
+        keep_client="${1:-}"
+        break
+        ;;
+      -*)
+        die "unknown detach-others option: $1"
+        ;;
+      *)
+        keep_client="$1"
+        ;;
+    esac
+    shift
+  done
+
+  if [[ -z "$keep_client" ]]; then
+    keep_client="$(tmux_cmd display-message -p '#{client_tty}' 2>/dev/null || true)"
+  fi
+  [[ -n "$keep_client" ]] || die "cannot determine current tmux client"
+
+  while IFS= read -r client; do
+    [[ -n "$client" ]] || continue
+    [[ "$client" == "$keep_client" ]] && continue
+    if ((dry_run)); then
+      printf '%s\n' "$client"
+    else
+      tmux_cmd detach-client -t "$client"
+    fi
+    count=$((count + 1))
+  done < <(tmux_cmd list-clients -F '#{client_tty}' 2>/dev/null || true)
+
+  if ((dry_run)); then
+    printf 'would detach %d client(s), keeping %s\n' "$count" "$keep_client" >&2
+  else
+    printf 'detached %d client(s), kept %s\n' "$count" "$keep_client"
+  fi
+}
+
 main() {
   while (($#)); do
     case "$1" in
@@ -624,6 +728,7 @@ main() {
     log) cmd_log "$@" ;;
     restore) cmd_restore "$@" ;;
     clean|cln) cmd_clean "$@" ;;
+    detach-others|detach-other-clients|do) cmd_detach_others "$@" ;;
     *) die "unknown command: $cmd" ;;
   esac
 }
